@@ -9,7 +9,7 @@ from typing import Optional, Tuple, Any, Dict, List
 
 class BQERDecoderLayer(nn.Module):
     """
-    TCEC-like residual correction with channel-wise (group_size=-1) or group-wise (group_size>0) K.
+    TCEC-like residual correction.
     """
     def __init__(
         self,
@@ -20,7 +20,7 @@ class BQERDecoderLayer(nn.Module):
         window_m: int = 0,
         alpha: float = 0.5,
         place: str = "post",
-        group_size: int = -1,                       # -1=channel-wise, >0=group-wise
+        group_size: int = 1,
     ):
         super().__init__()
         assert place in ("post",)
@@ -33,37 +33,25 @@ class BQERDecoderLayer(nn.Module):
         self.group_size = int(group_size)
 
         # Store K in compact form; expand lazily in forward.
-        if self.group_size is None or self.group_size <= 0:
-            # channel-wise: expect (C,)
-            C = hidden_size
-            Kc = torch.zeros(C, dtype=torch.float32)
-            if K_current is not None:
-                assert K_current.shape == (C,), f"Expected K_current shape {(C,)}, got {tuple(K_current.shape)}"
-                Kc = K_current.detach().clone().to(torch.float32)
-            self.register_buffer("K_vec", Kc, persistent=True)      # (C,)
-            self.register_buffer("K_groups", torch.empty(0), persistent=False)
-        else:
-            # group-wise: expect (G,)
-            G = (hidden_size + self.group_size - 1) // self.group_size
-            Kg = torch.zeros(G, dtype=torch.float32)
-            if K_current is not None:
-                assert K_current.dim() == 1, f"Expected 1D K_current with length G={G}"
-                Kg = K_current.detach().clone().to(torch.float32)
-            self.register_buffer("K_groups", Kg, persistent=True)   # (G,)
-            self.register_buffer("K_vec", torch.empty(0), persistent=False)
+        G = (hidden_size + self.group_size - 1) // self.group_size
+        Kg = torch.zeros(G, dtype=torch.float32)
+        if K_current is not None:
+            assert K_current.dim() == 1, f"Expected 1D K_current with length G={G}"
+            Kg = K_current.detach().clone().to(torch.float32)
+        self.register_buffer("K_groups", Kg, persistent=True)   # (G,)
+        self.register_buffer("K_vec", torch.empty(0), persistent=False)
 
         self.register_buffer("_prev_y", None, persistent=False)
 
     # ---- public helpers -------------------------------------------------
 
     def set_K(self, K_current: Optional[torch.Tensor] = None, K_prev: Optional[torch.Tensor] = None):
-        """Set/replace K buffers. Tensors should be shape (hidden_size,)."""
+        # NOTE: we store K either as K_vec (channel-wise) or K_groups (group-wise)
         if K_current is not None:
-            assert K_current.shape == (self.hidden_size,)
-            self.K_current = K_current.detach().to(self.K_current.device, dtype=self.K_current.dtype)
-        if K_prev is not None:
-            assert K_prev.shape == (self.hidden_size,)
-            self.K_prev = K_prev.detach().to(self.K_prev.device, dtype=self.K_prev.dtype)
+            G = (self.hidden_size + self.group_size - 1) // self.group_size
+            assert K_current.dim() == 1 and K_current.numel() == G
+            self.K_groups = K_current.detach().to(self.K_groups.device, dtype=torch.float32)
+        # K_prev unused for m=0; ignore
 
     def reset_cache(self):
         """Reset stored y_{l-1} (e.g., between prompts or at generation start)."""
@@ -74,11 +62,8 @@ class BQERDecoderLayer(nn.Module):
     def _expanded_K(self, like: torch.Tensor) -> torch.Tensor:
         """Return (1,1,C) K expanded to hidden_size, matching `like` dtype/device."""
         C = self.hidden_size
-        if self.group_size is None or self.group_size <= 0:
-            k = self.K_vec  # (C,)
-        else:
-            g = self.group_size
-            k = torch.repeat_interleave(self.K_groups, g)[:C]  # (C,)
+        G = (C + self.group_size - 1) // self.group_size
+        k = torch.repeat_interleave(self.K_groups, self.group_size)[:C]  # (C,)
         return k.view(1,1,-1).to(device=like.device, dtype=like.dtype)
 
     @torch.no_grad()
@@ -97,145 +82,87 @@ class BQERDecoderLayer(nn.Module):
         self._prev_y = y_cur.detach()
         return x_out if isinstance(out, torch.Tensor) else (x_out, *tail)
 
-# --------------------- Collect residuals and compute Ks --------------------------------------
+# --------------------- Accumulate stats and calibrate Ks --------------------------------------
 
 @torch.no_grad()
-def collect_layer_residuals(model: nn.Module, batch: Dict[str, torch.Tensor]) -> List[torch.Tensor]:
-    """
-    Run a single forward pass and collect per-layer residuals y_l = out - in.
-    Returns: list length L (num layers), each item shape (B, T, C).
-    """
-    # where are the decoder layers?
-    if hasattr(model, "model") and hasattr(model.model, "layers"):
-        layers = model.model.layers
-    elif hasattr(model, "layers"):
-        layers = model.layers
+def accumulate_stats(fp_model: nn.Module,
+                                 q_model: nn.Module,
+                                 dataloader,
+                                 device: str = "cuda",
+                                 group_size: int = 1):
+    # resolve L, C and layer lists
+    if hasattr(q_model, "model") and hasattr(q_model.model, "layers"):
+        L = len(q_model.model.layers)
+        C = q_model.config.hidden_size
+        q_layers = q_model.model.layers
+        fp_layers = fp_model.model.layers
     else:
-        raise ValueError("Could not locate the model decoder layers on the given model.")
+        L = len(q_model.layers)
+        C = q_model.config.hidden_size
+        q_layers = q_model.layers
+        fp_layers = fp_model.layers
 
-    y_buffers: List[List[torch.Tensor]] = [[] for _ in range(len(layers))]
-    handles = []
+    # per-layer CPU accumulators (fp32)
+    yq2  = {l: torch.zeros(C, dtype=torch.float32) for l in range(L)}
+    yqyf = {l: torch.zeros(C, dtype=torch.float32) for l in range(L)}
 
-    def hook_factory(slot_idx):
-        def hook(mod, inputs, outputs):
-            # inputs[0]: hidden_states in, outputs[0 or tensor]: hidden_states out
-            in_states = inputs[0]
-            out_states = outputs if isinstance(outputs, torch.Tensor) else outputs[0]
-            y = (out_states - in_states).detach()
-            y_buffers[slot_idx].append(y)
-            return outputs
-        return hook
+    q_model.eval().to(device)
+    fp_model.eval().to(device)
 
-    for i, layer in enumerate(layers):
-        handles.append(layer.register_forward_hook(hook_factory(i)))
-
-    _ = model(**batch)
-
-    for h in handles:
-        h.remove()
-
-    # stack per layer -> (N=1, B, T, C) cat later across many batches
-    return [torch.cat(buf, dim=0) if len(buf) > 0 else None for buf in y_buffers]
-
-
-@torch.no_grad()
-def collect_residuals_over_loader(
-    model: nn.Module,
-    dataloader,
-    device: str = "cuda",
-    max_batches: int = 64,
-) -> List[torch.Tensor]:
-    """
-    Iterate over a loader, gather residuals y per layer.
-    Returns: list length L, each item shape (N_total, T, C) on CPU.
-    """
-    model.eval().to(device)
-    # initialize lists
-    if hasattr(model, "model") and hasattr(model.model, "layers"):
-        L = len(model.model.layers)
-    else:
-        L = len(model.layers)
-
-    accum: List[List[torch.Tensor]] = [[] for _ in range(L)]
-
-    for bi, batch in tqdm(enumerate(dataloader), total=max_batches, desc="Collecting residuals over loader"):
-        if bi >= max_batches:
-            break
+    for _, batch in tqdm(enumerate(dataloader), total=len(dataloader), desc="Streaming stats"):
         batch = {k: v.to(device) for k, v in batch.items()}
-        ys = collect_layer_residuals(model, batch)  # list of (B, T, C)
-        for i, y in enumerate(ys):
-            if y is not None:
-                accum[i].append(y.to("cpu"))
-    # stack per layer
-    out: List[torch.Tensor] = []
-    for i in range(L):
-        if len(accum[i]) == 0:
-            out.append(None)
-        else:
-            out.append(torch.cat(accum[i], dim=0))  # (N_total, T, C)
-    return out
+
+        # ---- pass 1: Q model -> yq2 and cache yq (compact bf16) ----
+        yq_bt = [None] * L
+        q_handles = []
+        def q_hook_factory(i):
+            def hook(mod, inputs, outputs):
+                x_in  = inputs[0]
+                x_out = outputs if isinstance(outputs, torch.Tensor) else outputs[0]
+                yq = (x_out - x_in).reshape(-1, C)                    # (B*T, C) model dtype
+                yq32 = yq.to(torch.float32)
+                yq2[i].add_((yq32 * yq32).sum(dim=0).to("cpu"))       # Σ y_q^2
+                yq_bt[i] = yq.to(torch.bfloat16)                      # compact GPU cache
+                return outputs
+            return hook
+        for i, layer in enumerate(q_layers):
+            q_handles.append(layer.register_forward_hook(q_hook_factory(i)))
+        _ = q_model(**batch)
+        for h in q_handles: h.remove()
+
+        # ---- pass 2: FP model -> yqyf using cached yq ----
+        fp_handles = []
+        def fp_hook_factory(i):
+            def hook(mod, inputs, outputs):
+                x_in  = inputs[0]
+                x_out = outputs if isinstance(outputs, torch.Tensor) else outputs[0]
+                yf32 = (x_out - x_in).reshape(-1, C).to(torch.float32)  # (B*T,C)
+                if yq_bt[i] is not None:
+                    yq32 = yq_bt[i].to(torch.float32)
+                    yqyf[i].add_((yq32 * yf32).sum(dim=0).to("cpu"))     # Σ y_q y_fp
+                return outputs
+            return hook
+        for i, layer in enumerate(fp_layers):
+            fp_handles.append(layer.register_forward_hook(fp_hook_factory(i)))
+        _ = fp_model(**batch)
+        for h in fp_handles: h.remove()
+
+        del yq_bt
+        torch.cuda.empty_cache()
+
+    return yq2, yqyf
 
 
 @torch.no_grad()
-def bqer_K_closed_form(
-    y_q_list: torch.Tensor,      # (N,T,C)
-    y_fp_list: torch.Tensor,     # (N,T,C)
-    lambda1: float = 1e-6,
-    clip: float = 0.5,
-    group_size: int = -1,        # -1 channel-wise, >0 group-wise
-) -> torch.Tensor:
-    """
-    Returns K with shape:
-      - (C,) if group_size<=0 (channel-wise)
-      - (G,) if group_size>0  where G=ceil(C/group_size) (group-wise)
-    Uses ridge closed-form in fp32:
-      per-channel: K = (⟨yq,yf⟩ - ⟨yq,yq⟩) / (⟨yq,yq⟩ + λ)
-      per-group  : same but sums within groups.
-    """
-    assert y_q_list.dim() == 3 and y_fp_list.dim() == 3
-    N, T, C = y_q_list.shape
-    yq = y_q_list.reshape(-1, C).to(torch.float32)  # (M,C)
-    yf = y_fp_list.reshape(-1, C).to(torch.float32)
-
-    if group_size is None or group_size <= 0:
-        # channel-wise
-        Sqq = (yq * yq).sum(dim=0)      # (C,)
-        Sfq = (yq * yf).sum(dim=0)      # (C,)
-        K = (Sfq - Sqq) / (Sqq + lambda1)
-        if clip is not None:
-            K = K.clamp(-clip, clip)
-        return K  # (C,)
-
-    # group-wise
-    g = int(group_size)
-    G = (C + g - 1) // g
-    pad = G * g - C
-    yq_pad = torch.nn.functional.pad(yq, (0, pad))  # (M,G*g)
-    yf_pad = torch.nn.functional.pad(yf, (0, pad))  # (M,G*g)
-    yqv = yq_pad.view(-1, G, g)                     # (M,G,g)
-    yfv = yf_pad.view(-1, G, g)
-
-    Sqq_g = (yqv * yqv).sum(dim=(0,2))             # (G,)
-    Sfq_g = (yqv * yfv).sum(dim=(0,2))             # (G,)
-    Kg    = (Sfq_g - Sqq_g) / (Sqq_g + lambda1)    # (G,)
-    if clip is not None:
-        Kg = Kg.clamp(-clip, clip)
-    return Kg  # (G,)
-
-
-@torch.no_grad()
-def calibrate_bqer_Ks(
-    fp_model: nn.Module,
-    q_model: nn.Module,
-    dataloader,
-    device: str = "cuda",
-    max_batches: int = 64,
-    lambda1: float = 1e-6,
-    clip: float = 0.5,
-    group_size: int = -1,                 # NEW
-) -> Tuple[Dict[int, torch.Tensor], Dict[int, torch.Tensor]]:
-    y_q_layers = collect_residuals_over_loader(q_model, dataloader, device=device, max_batches=max_batches)
-    y_fp_layers = collect_residuals_over_loader(fp_model, dataloader, device=device, max_batches=max_batches)
+def calibrate_bqer(fp_model: nn.Module,
+                      q_model: nn.Module,
+                      dataloader,
+                      device: str = "cuda",
+                      lambda1: float = 1e-6,
+                      clip: float = 0.5,
+                      group_size: int = 1):
+    yq2, yqyf = accumulate_stats(fp_model, q_model, dataloader,
+                                             device=device, group_size=group_size)
 
     if hasattr(q_model, "model") and hasattr(q_model.model, "layers"):
         L = len(q_model.model.layers)
@@ -245,26 +172,29 @@ def calibrate_bqer_Ks(
         C = q_model.config.hidden_size
 
     Ks_cur, Ks_prev = {}, {}
-    for i in tqdm(range(L), total=L, desc=f"Calibrating BQER Ks"):
-        yq = y_q_layers[i]
-        yf = y_fp_layers[i]
-        if (yq is None) or (yf is None):
-            if group_size is None or group_size <= 0:
-                K = torch.zeros(C, dtype=torch.float32)
-            else:
-                G = (C + group_size - 1) // group_size
-                K = torch.zeros(G, dtype=torch.float32)
-        else:
-            K = bqer_K_closed_form(yq, yf, lambda1=lambda1, clip=clip, group_size=group_size).to("cpu")
-        Ks_cur[i] = K
-        Ks_prev[i] = K.clone()
+    for l in range(L):
+        sqq = yq2[l]     # (C,)
+        sfq = yqyf[l]    # (C,)
 
-        del yq, yf
-        torch.cuda.empty_cache()
-        
+        g = int(group_size)
+        G = (C + g - 1) // g
+        pad = G * g - C
+        if pad:
+            sqq = torch.nn.functional.pad(sqq, (0, pad))
+            sfq = torch.nn.functional.pad(sfq, (0, pad))
+        sqq_g = sqq.view(G, g).sum(dim=1)     # (G,)
+        sfq_g = sfq.view(G, g).sum(dim=1)     # (G,)
+        K = (sfq_g - sqq_g) / (sqq_g + lambda1)
+        if clip is not None:
+            K = K.clamp(-clip, clip)          # (G,)
+
+        Ks_cur[l]  = K.to(torch.float32)
+        Ks_prev[l] = K.clone()
+
     return Ks_cur, Ks_prev
 
-# --------------------- Apply BQER wrapper --------------------------------------
+
+# --------------------- Apply BQER to model --------------------------------------
 
 def wrap_model_with_bqer(
     model: nn.Module,
@@ -272,7 +202,7 @@ def wrap_model_with_bqer(
     Ks_prev: Optional[Dict[int, torch.Tensor]] = None,
     window_m: int = 0,
     alpha: float = 0.5,
-    group_size: int = -1,                  # -1 channel-wise, >0 group-wise
+    group_size: int = 1,
 ):
     if hasattr(model, "model") and hasattr(model.model, "layers"):
         layers = model.model.layers
@@ -303,7 +233,7 @@ def apply_bqer(
     Ks_prev: Dict[int, torch.Tensor],
     window_m: int = 0,
     alpha: float = 0.5,
-    group_size: int = -1,      # NEW
+    group_size: int = 1,
 ):
     wrap_model_with_bqer(
         q_model,

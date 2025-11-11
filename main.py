@@ -11,7 +11,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 
 from bqer import (
-    calibrate_bqer_Ks,
+    calibrate_bqer,
     apply_bqer,
 )
 from evaluator import eval_ppl
@@ -26,9 +26,9 @@ def calibrate_and_wrap_bqer(
     device: str = "cuda",
     args: argparse.Namespace = None,
 ):
-    Ks_cur, Ks_prev = calibrate_bqer_Ks(
+    Ks_cur, Ks_prev = calibrate_bqer(
         fp_model, q_model, dataloader, device=device,
-        max_batches=args.num_chunks, lambda1=args.lambda1, clip=args.clip, group_size=args.group_size,
+        lambda1=args.lambda1, clip=args.clip, group_size=args.group_size,
     )
     apply_bqer(q_model, Ks_cur, Ks_prev,
         window_m=args.window_m, alpha=args.alpha, group_size=args.group_size)
@@ -66,6 +66,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     HF_HOME = os.getenv("HF_HOME", "/data/hf_cache")
+    if args.num_chunks % args.bsz != 0:
+        raise ValueError(f"num_chunks must be divisible by bsz, but got {args.num_chunks} and {args.bsz}")
     # Load models
     fp_model = AutoModelForCausalLM.from_pretrained(args.model_name, dtype=torch.bfloat16, device_map="auto")
     q_model = AutoModelForCausalLM.from_pretrained(f"{HF_HOME}/hub/{args.model_name.split('/')[-1]}-{args.qbits}bits-g64", 
