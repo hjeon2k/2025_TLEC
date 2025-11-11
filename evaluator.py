@@ -83,10 +83,6 @@ def eval_ppl(model, tokenizer, seqlen=2048, device="cuda"):
 
     # Set dataset
     dataset = "wikitext2"
-
-    # Print status
-    print(f"evaluating on {dataset}")
-
     # Get the test loader
     _, testloader = get_loaders(
         dataset, seed=0, seqlen=model.seqlen, tokenizer=tokenizer,
@@ -108,8 +104,6 @@ def eval_ppl_wikitext_train(model, trainloader, bs=1, device=None):
 
     # List to store negative log likelihoods
     nlls = []
-    print(f"nsamples {nsamples}")
-
     # Loop through each batch
     for i in tqdm(range(0,nsamples,bs)):
 

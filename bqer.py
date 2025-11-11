@@ -111,7 +111,7 @@ def collect_layer_residuals(model: nn.Module, batch: Dict[str, torch.Tensor]) ->
     elif hasattr(model, "layers"):
         layers = model.layers
     else:
-        raise ValueError("Could not locate Llama decoder layers.")
+        raise ValueError("Could not locate the model decoder layers on the given model.")
 
     y_buffers: List[List[torch.Tensor]] = [[] for _ in range(len(layers))]
     handles = []
@@ -224,7 +224,7 @@ def bqer_K_closed_form(
 
 
 @torch.no_grad()
-def calibrate_bqer_Ks_from_loader(
+def calibrate_bqer_Ks(
     fp_model: nn.Module,
     q_model: nn.Module,
     dataloader,
@@ -266,7 +266,7 @@ def calibrate_bqer_Ks_from_loader(
 
 # --------------------- Apply BQER wrapper --------------------------------------
 
-def wrap_llama_with_bqer(
+def wrap_model_with_bqer(
     model: nn.Module,
     Ks_current: Dict[int, torch.Tensor],   # (C,) if channel-wise, (G,) if group-wise
     Ks_prev: Optional[Dict[int, torch.Tensor]] = None,
@@ -281,7 +281,7 @@ def wrap_llama_with_bqer(
         layers = model.layers
         hidden_size = model.config.hidden_size
     else:
-        raise ValueError("Could not locate Llama decoder layers on the given model.")
+        raise ValueError("Could not locate the model decoder layers on the given model.")
 
     for idx, layer in enumerate(layers):
         Kc = Ks_current.get(idx, None)
@@ -297,7 +297,7 @@ def wrap_llama_with_bqer(
         layers[idx] = wrapper
 
 
-def apply_bqer_wrapper(
+def apply_bqer(
     q_model: nn.Module,
     Ks_cur: Dict[int, torch.Tensor],
     Ks_prev: Dict[int, torch.Tensor],
@@ -305,7 +305,7 @@ def apply_bqer_wrapper(
     alpha: float = 0.5,
     group_size: int = -1,      # NEW
 ):
-    wrap_llama_with_bqer(
+    wrap_model_with_bqer(
         q_model,
         Ks_current=Ks_cur,
         Ks_prev=Ks_prev,
@@ -317,15 +317,3 @@ def apply_bqer_wrapper(
         if isinstance(layer, BQERDecoderLayer):
             layer.reset_cache()
 
-
-# --------------------- quick usage example -----------------------------------
-# from transformers import AutoModelForCausalLM
-# model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3-8B")
-# # Suppose you’ve estimated per-layer K’s (dicts of tensors with shape (hidden_size,))
-# Ks_cur = {i: torch.zeros(model.config.hidden_size) for i in range(len(model.model.layers))}
-# Ks_prev = {i: torch.zeros(model.config.hidden_size) for i in range(len(model.model.layers))}
-# wrap_llama_with_bqer(model, Ks_cur, Ks_prev, window_m=1)
-# # At generation time, remember to reset y-cache between prompts:
-# for layer in model.model.layers:
-#     if isinstance(layer, BQERDecoderLayer):
-#         layer.reset_cache()
