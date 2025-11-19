@@ -28,7 +28,7 @@ def calibrate_and_wrap_bqer(
 ):
     Ks_cur, Ks_prev = calibrate_bqer(
         fp_model, q_model, dataloader, device=device,
-        lambda1=args.lambda1, clip=args.clip, group_size=args.group_size,
+        window_m=args.window_m, lambda1=args.lambda1, clip=args.clip, group_size=args.group_size,
     )
     apply_bqer(q_model, Ks_cur, Ks_prev,
         window_m=args.window_m, alpha=args.alpha, group_size=args.group_size)
@@ -54,7 +54,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", "-m",type=str, default="meta-llama/Llama-3.2-3B")
     parser.add_argument("--qbits", "-q", type=int, default=2)
     # calibration data
-    parser.add_argument("--seqlen", "-s", type=int, default=16384)
+    parser.add_argument("--seqlen", "-s", type=int, default=8192)
     parser.add_argument("--num_chunks", "-n", type=int, default=256)
     # BQER parameters
     parser.add_argument("--lambda1", "-l", type=float, default=1e-5)
@@ -78,7 +78,8 @@ if __name__ == "__main__":
     dataloader = prepare_dataloader(encodings, max_seqlen=args.seqlen, num_chunks=args.num_chunks)
 
     print(f"Given config: " +
-          f"[lambda1={args.lambda1}, window_m={args.window_m}, clip={args.clip}, alpha={args.alpha}, group_size={args.group_size}]")
+          f"[model={args.model}, qbits={args.qbits}, seqlen={args.seqlen}, num_chunks={args.num_chunks}, " +
+          f"lambda1={args.lambda1}, window_m={args.window_m}, clip={args.clip}, alpha={args.alpha}, group_size={args.group_size}]")
 
     print(f"Evaluating perplexity of original model")
     ppl_test = eval_ppl(fp_model, tokenizer)
