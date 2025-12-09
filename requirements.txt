@@ -17,7 +17,6 @@ fastchat==0.1.0
 filelock==3.20.0
 frozenlist==1.8.0
 fsspec==2025.9.0
--e git+https://github.com/ModelCloud/GPTQModel@96355537ad3154d6db446fa1bbfdf842174ecc40#egg=GPTQModel
 h11==0.16.0
 hf-xet==1.1.10
 hf_transfer==0.1.9

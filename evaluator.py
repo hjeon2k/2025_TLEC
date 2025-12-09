@@ -10,6 +10,10 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from datasets import load_dataset
 from tqdm import tqdm
 
+from lm_eval import evaluator
+from lm_eval.utils import make_table
+from lm_eval.models.huggingface import HFLM
+
 # Set seed for reproducibility
 def set_seed(seed):
     np.random.seed(seed)
@@ -77,68 +81,6 @@ def get_loaders(name, nsamples=128, seed=0, seqlen=4096, tokenizer=None):
     if "c4" in name:
         return get_c4(nsamples, seed, seqlen, tokenizer)
 
-# Function to evaluate perplexity (ppl) on a specified model and tokenizer
-def eval_ppl(model, tokenizer, seqlen=2048, device="cuda"):
-    model.seqlen = seqlen
-
-    # Set dataset
-    dataset = "wikitext2"
-    # Get the test loader
-    _, testloader = get_loaders(
-        dataset, seed=0, seqlen=model.seqlen, tokenizer=tokenizer,
-    )
-
-    # Evaluate ppl in no grad context to avoid updating the model
-    with torch.no_grad():
-        ppl_test = eval_ppl_wikitext(model, testloader, 1, device)
-    return ppl_test
-
-# Function to evaluate perplexity (ppl) specifically on the wikitext dataset
-def eval_ppl_wikitext_train(model, trainloader, bs=1, device=None):
-    # Get input IDs
-    # testenc = testenc.input_ids
-
-    # Calculate number of samples
-    # nsamples = testenc.numel() // model.seqlen
-    nsamples = len(trainloader)
-
-    # List to store negative log likelihoods
-    nlls = []
-    # Loop through each batch
-    for i in tqdm(range(0,nsamples,bs)):
-
-        # Calculate end index
-        j = min(i+bs, nsamples)
-
-        # Prepare inputs and move to device
-        # inputs = testenc[:,(i * model.seqlen):(j * model.seqlen)].to(device)
-        inputs = trainloader[i][0].to(device)
-        inputs = inputs.reshape(j-i, model.seqlen)
-
-        # Forward pass through the model
-        lm_logits = model(inputs).logits
-
-        # Shift logits and labels for next token prediction
-        shift_logits = lm_logits[:, :-1, :].contiguous()
-        shift_labels = inputs[:, 1:]
-
-        # Compute loss
-        loss_fct = nn.CrossEntropyLoss()
-        loss = loss_fct(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1))
-
-        # Calculate negative log likelihood
-        neg_log_likelihood = loss.float() * model.seqlen * (j-i)
-
-        # Append to list of negative log likelihoods
-        nlls.append(neg_log_likelihood)
-
-    # Compute perplexity
-    ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
-
-    # Empty CUDA cache to save memory
-    torch.cuda.empty_cache()
-
-    return ppl.item()
 
 # Function to evaluate perplexity (ppl) specifically on the wikitext dataset
 def eval_ppl_wikitext(model, testenc, bs=1, device=None):
@@ -187,29 +129,82 @@ def eval_ppl_wikitext(model, testenc, bs=1, device=None):
 
     return ppl.item()
 
+# Function to evaluate perplexity (ppl) on a specified model and tokenizer
+def eval_ppl(model, tokenizer, seqlen=2048, device="cuda"):
+    model.seqlen = seqlen
 
-def get_llm(model_name, cache_dir="./assets/cache"):
+    # Set dataset
+    dataset = "wikitext2"
+    # Get the test loader
+    _, testloader = get_loaders(
+        dataset, seed=0, seqlen=model.seqlen, tokenizer=tokenizer,
+    )
+
+    # Evaluate ppl in no grad context to avoid updating the model
+    with torch.no_grad():
+        ppl_test = eval_ppl_wikitext(model, testloader, 1, device)
+    print(f"wikitext perplexity for {args.model}: {ppl_test}")
+    return ppl_test
+
+
+def eval_aime(model, tokenizer, device="cuda"):
+    lm_model = HFLM(
+        pretrained=model,
+        tokenizer=tokenizer,
+        device=device,
+    )
+
+    results = evaluator.simple_evaluate(
+        model=lm_model,
+        tasks=['aime'],
+        device=device,
+        max_batch_size="auto"
+    )
+    print(make_table(results))
+    return results
+
+
+def eval_csqa(model, tokenizer, device="cuda"):
+    lm_model = HFLM(
+        pretrained=model,
+        tokenizer=tokenizer,
+        device=device,
+    )
+
+    results = evaluator.simple_evaluate(
+        model=lm_model,
+        tasks=['mmlu', 'hellaswag', 'piqa', 'arc_challenge', 'arc_easy', 'openbookqa', 'winogrande'],
+        device=device,
+        max_batch_size="auto"
+    )
+    print(make_table(results))
+    return results
+
+
+
+def get_llm(model_name):
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.float16,
-        cache_dir=cache_dir,
+        dtype=torch.float16,
         device_map="auto"
     )
-    model.seqlen = 4096 if model.config.max_position_embeddings>=4096 else model.config.max_position_embeddings
     return model
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, help='LLaMA model')
-    parser.add_argument('--device', type=str, default='cuda:0', help='Device to use')
+    parser.add_argument('--model', '-m', type=str, help='LLaMA model')
+    parser.add_argument('--device', '-d', type=str, default='cuda:0', help='Device to use')
     args = parser.parse_args()
 
     model = get_llm(args.model)
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 
     model.eval()
-    ppl_test = eval_ppl(args, model, tokenizer, args.device)
-    print(f"wikitext perplexity for {args.model}: {ppl_test}")
+    # eval_ppl(model, tokenizer, args.device)
+    # eval_aime(model, tokenizer, args.device)
+    eval_csqa(model, tokenizer, args.device)
+
+
 
 
 if __name__ == '__main__':
